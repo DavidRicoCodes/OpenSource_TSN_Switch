@@ -1,0 +1,34 @@
+import re
+import csv
+
+# Expresiones regulares para capturar los paquetes PHY e IP
+phy_pattern = re.compile(r"PHY TX .* mcs=(\d+)")
+ip_pattern = re.compile(r"IP .* src=(\d+\.\d+\.\d+\.\d+):(\d+) dst=(\d+\.\d+\.\d+\.\d+):(\d+) proto=(\w+) seq=(\d+)")
+
+def parse_amarisoft_log(log_file, output_csv):
+    last_mcs = None
+    parsed_data = []
+    
+    with open(log_file, 'r', encoding='utf-8') as file:
+        for line in file:
+            phy_match = phy_pattern.search(line)
+            if phy_match:
+                last_mcs = int(phy_match.group(1))
+                continue
+            
+            ip_match = ip_pattern.search(line)
+            if ip_match:
+                src_ip, src_port, dst_ip, dst_port, proto, seq = ip_match.groups()
+                parsed_data.append([src_ip, src_port, dst_ip, dst_port, proto, seq, last_mcs])
+    
+    with open(output_csv, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Source IP", "Source Port", "Destination IP", "Destination Port", "Protocol", "Sequence Number", "MCS"])
+        writer.writerows(parsed_data)
+
+# Uso del script
+log_filename = "amarisoft.log"  # Nombre del archivo de log
+output_filename = "parsed_data.csv"  # Nombre del archivo de salida
+parse_amarisoft_log(log_filename, output_filename)
+
+print(f"Datos extraídos y guardados en {output_filename}")
