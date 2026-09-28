@@ -5,10 +5,18 @@
 #include <stdint.h>
 #include <net/if.h>
 #include "common.h"
+#include "classify.h"
 #include "gcl.h"
 
 enum xdp_mode_cfg { XDP_MODE_AUTO, XDP_MODE_NATIVE, XDP_MODE_SKB };
 enum tri_cfg { TRI_AUTO = -1, TRI_OFF = 0, TRI_ON = 1 };
+
+/* Token bucket of one traffic class (asynchronous traffic shaping). */
+struct ats_cfg {
+	int enabled;
+	uint64_t rate_bps;        /* committed rate, bits per second */
+	uint64_t burst_bytes;     /* bucket size */
+};
 
 struct port_cfg {
 	char name[32];
@@ -20,6 +28,7 @@ struct port_cfg {
 	int guard_band;
 	uint64_t lookahead_ns;
 	struct gcl gcl;
+	struct ats_cfg ats[TSN_NUM_TC];
 };
 
 struct static_fdb {
@@ -52,6 +61,9 @@ struct switch_cfg {
 
 	int nstatic;
 	struct static_fdb fdb_static[256];
+
+	/* [classify] */
+	struct cls_table cls;
 };
 
 int config_load(struct switch_cfg *c, const char *path);

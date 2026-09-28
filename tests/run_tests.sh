@@ -178,7 +178,90 @@ t_strict_priority() {
 	return $rc
 }
 
-ALL="connectivity learning link_local tcp qbv_windows guard_band strict_priority"
+t_classify_l3() {
+	# Untagged UDP/IP traffic: rules put port 5000 and DSCP EF into TC7.
+	start_switch tests/conf/classify.conf || return 1
+	learn_all
+	capture 1 5 "$WORK/h1.json"
+	sleep 0.5
+	h 0 $TT send --iface eth0 --src $MAC0 --dst $MAC1 --untagged \
+		--udp 5000,6000,6001 --dscp 0,0,46 --label 7,0,6 --rate 3000 --duration 3 >/dev/null
+	wait_captures
+	local rc=0
+	$TT analyze "$WORK/h1.json" --cycle 10ms --tolerance 50us \
+		--window 7:0-3ms --window 6:0-3ms --window 0:3ms-10ms \
+		--count 7:3000:3000 --count 6:3000:3000 --count 0:3000:3000 \
+		>"$WORK/report" || { cat "$WORK/report"; rc=1; }
+	stop_switch || rc=1
+	grep -q "hits=3000: ip_proto=udp dst_port=5000" "$WORK/switch.log" &&
+		grep -q "hits=3000: in_port=p0 src_ip" "$WORK/switch.log" ||
+		{ echo "  unexpected rule hit counters:"; grep "^rule" "$WORK/switch.log"; rc=1; }
+	return $rc
+}
+
+t_vlan_port_map() {
+	# VID 200 is mapped to p2 by a rule, even though the MAC belongs to h1.
+	start_switch tests/conf/classify.conf || return 1
+	learn_all
+	capture 1 3 "$WORK/h1.json"
+	capture 2 3 "$WORK/h2.json"
+	sleep 0.5
+	h 0 $TT send --iface eth0 --src $MAC0 --dst $MAC1 --pcp 0,0 --vid 100,200 --label 1,2 \
+		--rate 2000 --duration 1 >/dev/null
+	wait_captures
+	local rc=0
+	$TT analyze "$WORK/h1.json" --count 1:1000:1000 --never 2 >/dev/null ||
+		{ echo "  h1 must get only VID 100"; rc=1; }
+	$TT analyze "$WORK/h2.json" --count 2:1000:1000 --never 1 >/dev/null ||
+		{ echo "  h2 must get only VID 200"; rc=1; }
+	stop_switch || rc=1
+	return $rc
+}
+
+t_ats() {
+	start_switch tests/conf/ats.conf || return 1
+	learn_all
+	capture 1 5 "$WORK/h1.json"
+	sleep 0.5
+	# 8 Mbit/s offered per class; TC7 is shaped to 2 Mbit/s, TC0 is not shaped.
+	h 0 $TT send --iface eth0 --src $MAC0 --dst $MAC1 --pcp 7,0 --size 1000 --rate 2000 --duration 3 >/dev/null
+	wait_captures
+	local rc=0
+	$TT analyze "$WORK/h1.json" --rate 7:1.9:2.1 --count 0:3000:3000 >"$WORK/report" ||
+		{ cat "$WORK/report"; rc=1; }
+	echo "  TC7 shaped rate: $(python3 -c "import json;print(json.load(open('/dev/stdin'))['7']['rate_mbps'])" < <(head -n -1 "$WORK/report")) Mbit/s (bucket 2 Mbit/s)"
+	stop_switch || rc=1
+	return $rc
+}
+
+t_reload() {
+	# Swap the two windows of the schedule with SIGHUP while traffic runs.
+	cp tests/conf/qbv.conf "$WORK/reload.conf"
+	start_switch "$WORK/reload.conf" || return 1
+	learn_all
+	local rc=0
+	capture 1 3 "$WORK/before.json"
+	sleep 0.3
+	h 0 $TT send --iface eth0 --src $MAC0 --dst $MAC1 --pcp 7,0 --rate 4000 --duration 2 >/dev/null
+	wait_captures
+	sed -i 's/^sched-entry = S 80 3ms/sched-entry = S 01 3ms/; t; s/^sched-entry = S 01 7ms/sched-entry = S 80 7ms/' \
+		"$WORK/reload.conf"
+	kill -HUP $SW_PID
+	sleep 1.5
+	grep -q "new schedules" "$WORK/switch.log" || { echo "  no reload message"; rc=1; }
+	capture 1 3 "$WORK/after.json"
+	sleep 0.3
+	h 0 $TT send --iface eth0 --src $MAC0 --dst $MAC1 --pcp 7,0 --rate 4000 --duration 2 >/dev/null
+	wait_captures
+	$TT analyze "$WORK/before.json" --cycle 10ms --tolerance 50us --window 7:0-3ms --window 0:3ms-10ms \
+		--expect 7 --expect 0 >"$WORK/report" || { echo "  before reload:"; cat "$WORK/report"; rc=1; }
+	$TT analyze "$WORK/after.json" --cycle 10ms --tolerance 50us --window 0:0-3ms --window 7:3ms-10ms \
+		--expect 7 --expect 0 >"$WORK/report" || { echo "  after reload:"; cat "$WORK/report"; rc=1; }
+	stop_switch || rc=1
+	return $rc
+}
+
+ALL="connectivity learning link_local tcp qbv_windows guard_band strict_priority classify_l3 vlan_port_map ats reload"
 TESTS=${*:-$ALL}
 
 for t in $TESTS; do
