@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * tsn-switch: an IEEE 802.1Q bridge with an 802.1Qbv time-aware shaper,
+ * token-bucket asynchronous traffic shaping and programmable classification,
  * built on AF_XDP.
  *
  * Data path (one busy-polling thread per port):
  *
  *   NIC -> XDP (redirect) -> AF_XDP RX ring
- *       -> classify (PCP -> traffic class) -> learn / look up MAC
+ *       -> classify (rules, else PCP -> traffic class) -> learn / look up MAC
  *       -> enqueue descriptor on the egress port's per-class queue
  *   egress thread:
- *       gate control list -> strict priority among open gates
+ *       gate control list (802.1Qbv) + token buckets (ATS)
+ *       -> strict priority among eligible classes
  *       -> link-rate model + guard band -> AF_XDP TX ring -> NIC
  *
  * All ports share one UMEM, so frames are never copied in user space.
@@ -49,6 +51,21 @@ struct tc_stats {
 	_Atomic uint64_t drop;  /* written by producers on other ports */
 };
 
+/* Token bucket, in units of 1e-9 bit so refills need no division. */
+struct tbucket {
+	int enabled;
+	uint64_t rate_bps;
+	int64_t cap;
+	int64_t tokens;
+	int64_t last;
+};
+
+/* New shaping parameters handed from the main thread (SIGHUP) to a port thread. */
+struct port_update {
+	struct gcl gcl;
+	struct ats_cfg ats[TSN_NUM_TC];
+};
+
 struct port {
 	int idx;
 	const struct port_cfg *cfg;
@@ -59,6 +76,8 @@ struct port {
 	struct xsk xsk;
 
 	struct gcl gcl;         /* private copy: gcl_eval() updates the hint */
+	struct tbucket tb[TSN_NUM_TC];
+	_Atomic(struct port_update *) update;
 	uint64_t ps_per_byte;   /* 0 = link rate unknown, no pacing */
 	int64_t wire_free_at;
 
@@ -78,12 +97,14 @@ static struct fdb fdb;
 static struct port ports[TSN_MAX_PORTS];
 static int nports;
 static struct xdp_prog xprog;
-static volatile sig_atomic_t stop;
+static volatile sig_atomic_t stop, reload_req;
 
 static void on_signal(int sig)
 {
-	(void)sig;
-	stop = 1;
+	if (sig == SIGHUP)
+		reload_req = 1;
+	else
+		stop = 1;
 }
 
 static inline int64_t now_ns(void)
@@ -125,12 +146,25 @@ static inline void rx_frame(struct port *in, uint64_t addr, uint32_t len, uint32
 	if ((proto == ETH_P_8021Q_ || proto == ETH_P_8021AD_) && len >= ETH_HLEN_ + 4)
 		pcp = pkt[14] >> 5;
 	int tc = cfg.pcp_to_tc[pcp];
+	int forced = -1;
+
+	if (cfg.cls.n) {
+		int r = classify(&cfg.cls, pkt, len, in->idx);
+		if (r >= 0) {
+			const struct cls_rule *rule = &cfg.cls.rule[r];
+			if (rule->tc >= 0)
+				tc = rule->tc;
+			forced = rule->out_port;
+		}
+	}
 
 	const uint8_t *dst = pkt, *src = pkt + 6;
 	if (likely(!mac_is_multicast(src)))
 		fdb_learn(&fdb, src, in->idx, now_s);
 
-	int out = mac_is_multicast(dst) ? -1 : fdb_lookup(&fdb, dst, now_s);
+	int out = forced;
+	if (out < 0 && !mac_is_multicast(dst))
+		out = fdb_lookup(&fdb, dst, now_s);
 	if (out == in->idx) {
 		/* Destination lives on the ingress segment: filter. */
 		STAT_INC(in->rx_filtered);
@@ -207,6 +241,40 @@ static void comp_reap(struct port *p)
 
 /* ------------------------------------------------------- 802.1Qbv TX -- */
 
+static void tb_configure(struct tbucket *b, const struct ats_cfg *c, int64_t now)
+{
+	int64_t cap = (int64_t)c->burst_bytes * 8 * 1000000000;
+
+	if (!c->enabled) {
+		memset(b, 0, sizeof(*b));
+		return;
+	}
+	/* A fresh bucket starts full; a reconfigured one keeps its credit. */
+	b->tokens = b->enabled ? (b->tokens < cap ? b->tokens : cap) : cap;
+	b->enabled = 1;
+	b->rate_bps = c->rate_bps;
+	b->cap = cap;
+	b->last = now;
+}
+
+static inline void tb_refill(struct tbucket *b, int64_t now)
+{
+	int64_t dt = now - b->last;
+
+	if (dt <= 0)
+		return;
+	b->last = now;
+	if (dt >= (b->cap - b->tokens) / (int64_t)b->rate_bps + 1)
+		b->tokens = b->cap;
+	else
+		b->tokens += dt * (int64_t)b->rate_bps;
+}
+
+static inline int64_t tb_cost(uint32_t len)
+{
+	return (int64_t)len * 8 * 1000000000;
+}
+
 static inline int64_t wire_ns(const struct port *p, uint32_t len)
 {
 	return (int64_t)(((uint64_t)len + WIRE_OVERHEAD) * p->ps_per_byte / 1000);
@@ -219,6 +287,8 @@ static inline int64_t wire_ns(const struct port *p, uint32_t len)
  *   - no more than tx_lookahead of traffic is queued ahead in the NIC, and
  *   - a frame is only started if it will finish before its gate closes
  *     (guard band), otherwise it waits for the next window.
+ * A class with a token bucket (ATS) is additionally only eligible while its
+ * bucket holds enough credit for the frame at the head of its queue.
  */
 static void tx_schedule(struct port *p, int64_t now)
 {
@@ -245,7 +315,12 @@ static void tx_schedule(struct port *p, int64_t now)
 
 		if (!(gs.gates & (1u << tc)))
 			continue;
+		struct tbucket *tb = p->tb[tc].enabled ? &p->tb[tc] : NULL;
+		if (tb)
+			tb_refill(tb, now);
 		while (free && mpsc_peek(q, &addr, &len)) {
+			if (tb && tb->tokens < tb_cost(len))
+				break; /* not eligible yet: lower classes may go */
 			if (paced) {
 				if (p->wire_free_at > horizon)
 					break;
@@ -254,6 +329,8 @@ static void tx_schedule(struct port *p, int64_t now)
 					break; /* would overrun the window: hold */
 				p->wire_free_at = finish;
 			}
+			if (tb)
+				tb->tokens -= tb_cost(len);
 			mpsc_pop(q);
 			struct xdp_desc *d = xring_tx_desc(tx, tx->cached_prod++);
 			d->addr = addr;
@@ -293,7 +370,18 @@ static void *port_thread(void *arg)
 	snprintf(name, sizeof(name), "tsn-%.11s", p->cfg->name);
 	pthread_setname_np(pthread_self(), name);
 
+	for (int tc = 0; tc < TSN_NUM_TC; tc++)
+		tb_configure(&p->tb[tc], &p->cfg->ats[tc], now_ns());
+
 	while (!stop) {
+		struct port_update *u = atomic_load_explicit(&p->update, memory_order_relaxed);
+		if (unlikely(u) && (u = atomic_exchange(&p->update, NULL))) {
+			int64_t now = now_ns();
+			p->gcl = u->gcl;
+			for (int tc = 0; tc < TSN_NUM_TC; tc++)
+				tb_configure(&p->tb[tc], &u->ats[tc], now);
+			free(u);
+		}
 		comp_reap(p);
 		rx_poll(p);
 		fill_refill(p);
@@ -488,6 +576,8 @@ static void teardown(void)
 	for (int i = 0; i < nports; i++)
 		for (int tc = 0; tc < TSN_NUM_TC; tc++)
 			mpsc_free(&ports[i].txq[tc]);
+	for (int i = 0; i < nports; i++)
+		free(atomic_exchange(&ports[i].update, NULL));
 	frame_pool_destroy(&pool);
 }
 
@@ -593,6 +683,73 @@ static void print_final(void)
 			printf(" %d:%llu", tc, (unsigned long long)atomic_load(&p->tc[tc].drop));
 		printf("\n");
 	}
+	for (int i = 0; i < cfg.cls.n; i++)
+		printf("rule %d hits=%llu: %s\n", i, (unsigned long long)atomic_load(&cfg.cls.hits[i]),
+		       cfg.cls.rule[i].text);
+}
+
+/* ---------------------------------------------------------------- reload -- */
+
+static int same_rules(const struct cls_table *a, const struct cls_table *b)
+{
+	if (a->n != b->n)
+		return 0;
+	for (int i = 0; i < a->n; i++)
+		if (strcmp(a->rule[i].text, b->rule[i].text))
+			return 0;
+	return 1;
+}
+
+/*
+ * SIGHUP: re-read the configuration and hand each port thread its new gate
+ * control list and token buckets. The new GCL takes effect immediately; its
+ * phase is fixed by base_time, so an unchanged schedule is not disturbed.
+ * Everything else (ports, rules, rings, ...) needs a restart.
+ */
+static void reload_config(const char *path)
+{
+	struct switch_cfg *n = malloc(sizeof(*n));
+
+	printf("SIGHUP: reloading %s\n", path);
+	if (!n || config_load(n, path)) {
+		fprintf(stderr, "reload failed, keeping the running configuration\n");
+		free(n);
+		return;
+	}
+	if (n->nports != nports) {
+		fprintf(stderr, "reload refused: the set of ports changed (restart needed)\n");
+		free(n);
+		return;
+	}
+	for (int i = 0; i < nports; i++) {
+		const struct port_cfg *a = &cfg.port[i], *b = &n->port[i];
+		if (strcmp(a->name, b->name) || strcmp(a->ifname, b->ifname) || a->queue != b->queue) {
+			fprintf(stderr, "reload refused: port %d changed (restart needed)\n", i);
+			free(n);
+			return;
+		}
+		if (a->cpu != b->cpu || a->default_pcp != b->default_pcp || a->link_mbps != b->link_mbps ||
+		    a->guard_band != b->guard_band || a->lookahead_ns != b->lookahead_ns)
+			fprintf(stderr, "warning: port %s: only sched-entry/base_time/cycle_time/ats are "
+				"reloaded, other port keys need a restart\n", a->name);
+	}
+	if (!same_rules(&cfg.cls, &n->cls) || memcmp(cfg.pcp_to_tc, n->pcp_to_tc, sizeof(cfg.pcp_to_tc)))
+		fprintf(stderr, "warning: [classify] and [pcp-map] changes need a restart\n");
+
+	for (int i = 0; i < nports; i++) {
+		struct port_update *u = malloc(sizeof(*u));
+		if (!u)
+			break;
+		u->gcl = n->port[i].gcl;
+		memcpy(u->ats, n->port[i].ats, sizeof(u->ats));
+		cfg.port[i].gcl = n->port[i].gcl;
+		memcpy(cfg.port[i].ats, n->port[i].ats, sizeof(cfg.port[i].ats));
+		free(atomic_exchange(&ports[i].update, u));
+	}
+	free(n);
+	printf("new schedules:\n");
+	config_dump(&cfg);
+	fflush(stdout);
 }
 
 /* ----------------------------------------------------------------- main -- */
@@ -605,7 +762,8 @@ static void usage(const char *prog)
 		"  -b, --bpf FILE      XDP object (default: tsn_xdp.bpf.o next to the binary)\n"
 		"  -n, --check         parse the configuration, print it and exit\n"
 		"  -q, --quiet         do not print periodic statistics\n"
-		"  -h, --help          this help\n", prog);
+		"  -h, --help          this help\n"
+		"SIGHUP re-reads the gate control lists and ATS token buckets.\n", prog);
 }
 
 int main(int argc, char **argv)
@@ -648,6 +806,7 @@ int main(int argc, char **argv)
 	struct sigaction sa = { .sa_handler = on_signal };
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGHUP, &sa, NULL);
 
 	if (setup()) {
 		teardown();
@@ -681,11 +840,13 @@ int main(int argc, char **argv)
 	clock_gettime(CLOCK_MONOTONIC, &last);
 
 	while (!stop) {
-		if (!cfg.stats_interval) {
-			pause();
-			continue;
+		sleep(cfg.stats_interval ? cfg.stats_interval : 1);
+		if (reload_req) {
+			reload_req = 0;
+			reload_config(cfg_path);
 		}
-		sleep(cfg.stats_interval);
+		if (!cfg.stats_interval)
+			continue;
 		struct timespec t;
 		clock_gettime(CLOCK_MONOTONIC, &t);
 		double dt = (t.tv_sec - last.tv_sec) + (t.tv_nsec - last.tv_nsec) / 1e9;

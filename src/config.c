@@ -4,7 +4,9 @@
  *
  *   [global]        key = value
  *   [pcp-map]       <pcp> = <tc>
- *   [port <name>]   key = value, sched-entry = S <hex-gates> <interval>
+ *   [port <name>]   key = value, sched-entry = S <hex-gates> <interval>,
+ *                   ats = <tc> <rate-Mbit/s> <burst-bytes>
+ *   [classify]      rule = <field>=<value>... tc=<n> and/or port=<name>
  *   [fdb]           static = <mac> <port-name>
  *
  * Durations accept ns (default), us, ms and s suffixes. '#' and ';' start
@@ -17,6 +19,7 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <arpa/inet.h>
 #include "config.h"
 
 #define ERR(...) do { fprintf(stderr, "%s:%d: ", path, lineno); fprintf(stderr, __VA_ARGS__); \
@@ -142,6 +145,156 @@ static void port_defaults(struct port_cfg *p, const char *name)
 	p->lookahead_ns = 20000;
 }
 
+static int parse_port_range(const char *v, uint16_t *lo, uint16_t *hi)
+{
+	unsigned int a, b;
+	char tail;
+
+	if (sscanf(v, "%u-%u%c", &a, &b, &tail) == 2 && a <= b && b <= 65535) {
+		*lo = a;
+		*hi = b;
+		return 0;
+	}
+	if (sscanf(v, "%u%c", &a, &tail) == 1 && a <= 65535) {
+		*lo = *hi = a;
+		return 0;
+	}
+	return -1;
+}
+
+static int parse_prefix(const char *v, uint32_t *addr, uint32_t *mask)
+{
+	char buf[32];
+	unsigned int len = 32;
+	struct in_addr ia;
+
+	snprintf(buf, sizeof(buf), "%s", v);
+	char *slash = strchr(buf, '/');
+	if (slash) {
+		char tail;
+		*slash = 0;
+		if (sscanf(slash + 1, "%u%c", &len, &tail) != 1 || len > 32)
+			return -1;
+	}
+	if (inet_pton(AF_INET, buf, &ia) != 1)
+		return -1;
+	*mask = len ? ~0u << (32 - len) : 0;
+	*addr = ntohl(ia.s_addr) & *mask;
+	return 0;
+}
+
+/*
+ * rule = [in_port=<name>] [vid=<n>|untagged] [pcp=<n>] [ethertype=<hex>]
+ *        [src_mac=..] [dst_mac=..] [ip_proto=udp|tcp|icmp|<n>]
+ *        [src_ip=a.b.c.d[/len]] [dst_ip=..] [dscp=<n>]
+ *        [src_port=<n>[-<m>]] [dst_port=..]   tc=<n> and/or port=<name>
+ */
+static int parse_rule(const char *text, struct cls_rule *r, char *in_name, char *out_name,
+		      char *err, size_t errlen)
+{
+	char buf[512];
+	char *save, *tok;
+	uint64_t u;
+
+	memset(r, 0, sizeof(*r));
+	r->tc = -1;
+	r->out_port = -1;
+	in_name[0] = out_name[0] = 0;
+	snprintf(r->text, sizeof(r->text), "%s", text);
+	snprintf(buf, sizeof(buf), "%s", text);
+
+	for (tok = strtok_r(buf, " \t", &save); tok; tok = strtok_r(NULL, " \t", &save)) {
+		if (!strcmp(tok, "untagged")) {
+			r->fields |= CLS_UNTAGGED;
+			continue;
+		}
+		char *eq = strchr(tok, '=');
+		if (!eq) {
+			snprintf(err, errlen, "expected field=value, got '%s'", tok);
+			return -1;
+		}
+		*eq = 0;
+		const char *k = tok, *v = eq + 1;
+		int bad = 0;
+
+		if (!strcmp(k, "in_port")) {
+			snprintf(in_name, 32, "%s", v);
+			r->fields |= CLS_IN_PORT;
+		} else if (!strcmp(k, "vid")) {
+			bad = parse_u64(v, &u) || u > 4095;
+			r->vid = u;
+			r->fields |= CLS_VID;
+		} else if (!strcmp(k, "pcp")) {
+			bad = parse_u64(v, &u) || u > 7;
+			r->pcp = u;
+			r->fields |= CLS_PCP;
+		} else if (!strcmp(k, "ethertype")) {
+			bad = parse_u64(v, &u) || u > 0xffff;
+			r->ethertype = u;
+			r->fields |= CLS_ETHERTYPE;
+		} else if (!strcmp(k, "src_mac")) {
+			bad = parse_mac(v, r->smac);
+			r->fields |= CLS_SMAC;
+		} else if (!strcmp(k, "dst_mac")) {
+			bad = parse_mac(v, r->dmac);
+			r->fields |= CLS_DMAC;
+		} else if (!strcmp(k, "ip_proto")) {
+			if (!strcasecmp(v, "udp")) u = 17;
+			else if (!strcasecmp(v, "tcp")) u = 6;
+			else if (!strcasecmp(v, "icmp")) u = 1;
+			else if (!strcasecmp(v, "sctp")) u = 132;
+			else bad = parse_u64(v, &u) || u > 255;
+			r->ip_proto = u;
+			r->fields |= CLS_IP_PROTO;
+		} else if (!strcmp(k, "src_ip")) {
+			bad = parse_prefix(v, &r->sip, &r->sip_mask);
+			r->fields |= CLS_SIP;
+		} else if (!strcmp(k, "dst_ip")) {
+			bad = parse_prefix(v, &r->dip, &r->dip_mask);
+			r->fields |= CLS_DIP;
+		} else if (!strcmp(k, "dscp")) {
+			bad = parse_u64(v, &u) || u > 63;
+			r->dscp = u;
+			r->fields |= CLS_DSCP;
+		} else if (!strcmp(k, "src_port")) {
+			bad = parse_port_range(v, &r->sport_lo, &r->sport_hi);
+			r->fields |= CLS_SPORT;
+		} else if (!strcmp(k, "dst_port")) {
+			bad = parse_port_range(v, &r->dport_lo, &r->dport_hi);
+			r->fields |= CLS_DPORT;
+		} else if (!strcmp(k, "tc")) {
+			bad = parse_u64(v, &u) || u >= TSN_NUM_TC;
+			r->tc = u;
+		} else if (!strcmp(k, "port")) {
+			snprintf(out_name, 32, "%s", v);
+		} else {
+			snprintf(err, errlen, "unknown rule field '%s'", k);
+			return -1;
+		}
+		if (bad) {
+			snprintf(err, errlen, "bad value for '%s': '%s'", k, v);
+			return -1;
+		}
+	}
+	if (r->tc < 0 && !out_name[0]) {
+		snprintf(err, errlen, "rule needs an action: tc=<n> and/or port=<name>");
+		return -1;
+	}
+	if ((r->fields & CLS_UNTAGGED) && (r->fields & (CLS_VID | CLS_PCP))) {
+		snprintf(err, errlen, "'untagged' cannot be combined with vid/pcp");
+		return -1;
+	}
+	return 0;
+}
+
+static int find_port(const struct switch_cfg *c, const char *name)
+{
+	for (int i = 0; i < c->nports; i++)
+		if (!strcmp(c->port[i].name, name))
+			return i;
+	return -1;
+}
+
 static int is_pow2(uint64_t x)
 {
 	return x && !(x & (x - 1));
@@ -149,8 +302,10 @@ static int is_pow2(uint64_t x)
 
 int config_load(struct switch_cfg *c, const char *path)
 {
-	enum { S_NONE, S_GLOBAL, S_PCP, S_PORT, S_FDB } sec = S_NONE;
-	char static_port[256][32];
+	enum { S_NONE, S_GLOBAL, S_PCP, S_PORT, S_FDB, S_CLS } sec = S_NONE;
+	static char static_port[256][32];
+	static char rule_in[CLS_MAX_RULES][32], rule_out[CLS_MAX_RULES][32];
+	static int rule_line[CLS_MAX_RULES];
 	struct port_cfg *p = NULL;
 	char line[512];
 	int lineno = 0;
@@ -185,6 +340,8 @@ int config_load(struct switch_cfg *c, const char *path)
 				sec = S_PCP;
 			} else if (!strcasecmp(name, "fdb")) {
 				sec = S_FDB;
+			} else if (!strcasecmp(name, "classify")) {
+				sec = S_CLS;
 			} else if (!strncasecmp(name, "port", 4) && isspace((unsigned char)name[4])) {
 				char *pname = trim(name + 4);
 				if (c->nports == TSN_MAX_PORTS)
@@ -305,6 +462,17 @@ int config_load(struct switch_cfg *c, const char *path)
 			} else if (!strcmp(k, "cycle_time")) {
 				if (parse_duration(v, &u) || u == 0) ERR("bad cycle_time");
 				p->gcl.cycle_time = u;
+			} else if (!strcmp(k, "ats")) {
+				unsigned int tc;
+				double mbps;
+				unsigned long long burst;
+				char extra;
+				if (sscanf(v, "%u %lf %llu %c", &tc, &mbps, &burst, &extra) != 3 ||
+				    tc >= TSN_NUM_TC || mbps <= 0 || burst < 64)
+					ERR("ats = <tc> <rate-Mbit/s> <burst-bytes> (burst >= 64)");
+				p->ats[tc].enabled = 1;
+				p->ats[tc].rate_bps = (uint64_t)(mbps * 1e6 + 0.5);
+				p->ats[tc].burst_bytes = burst;
 			} else if (!strcmp(k, "sched-entry")) {
 				char cmd[8], gates[16], interval[32], extra;
 				if (sscanf(v, "%7s %15s %31s %c", cmd, gates, interval, &extra) != 3)
@@ -323,6 +491,22 @@ int config_load(struct switch_cfg *c, const char *path)
 					ERR("bad interval '%s'", interval);
 			} else {
 				ERR("unknown port key '%s'", k);
+			}
+			break;
+
+		case S_CLS:
+			if (strcmp(k, "rule"))
+				ERR("only 'rule = ...' is allowed in [classify]");
+			if (c->cls.n == CLS_MAX_RULES)
+				ERR("too many rules (max %d)", CLS_MAX_RULES);
+			{
+				char err[128];
+				int n = c->cls.n;
+				if (parse_rule(v, &c->cls.rule[n], rule_in[n], rule_out[n], err, sizeof(err)))
+					ERR("%s", err);
+				rule_line[n] = lineno;
+				c->cls.fields |= c->cls.rule[n].fields;
+				c->cls.n++;
 			}
 			break;
 
@@ -366,6 +550,15 @@ int config_load(struct switch_cfg *c, const char *path)
 		if (c->fdb_static[i].port < 0)
 			ERR("static FDB entry references unknown port '%s'", static_port[i]);
 	}
+	for (int i = 0; i < c->cls.n; i++) {
+		struct cls_rule *r = &c->cls.rule[i];
+		lineno = rule_line[i];
+		if (rule_in[i][0] && (r->in_port = find_port(c, rule_in[i])) < 0)
+			ERR("rule references unknown port '%s'", rule_in[i]);
+		if (rule_out[i][0] && (r->out_port = find_port(c, rule_out[i])) < 0)
+			ERR("rule references unknown port '%s'", rule_out[i]);
+	}
+
 	/* Worst case: every fill and TX ring full and every egress queue full. */
 	uint64_t need = (uint64_t)c->nports * (c->ring_size * 3 + TSN_NUM_TC * c->queue_depth);
 	if (need > c->frames)
@@ -388,8 +581,12 @@ void config_dump(const struct switch_cfg *c)
 		printf("port %d '%s' if=%s q=%u cpu=%d default_pcp=%u link=%lld Mb/s guard_band=%s\n",
 		       i, p->name, p->ifname, p->queue, p->cpu, p->default_pcp,
 		       (long long)p->link_mbps, p->guard_band ? "on" : "off");
+		for (int tc = TSN_NUM_TC - 1; tc >= 0; tc--)
+			if (p->ats[tc].enabled)
+				printf("    ats tc%d: %.3f Mbit/s, burst %llu B\n", tc, p->ats[tc].rate_bps / 1e6,
+				       (unsigned long long)p->ats[tc].burst_bytes);
 		if (!p->gcl.n) {
-			printf("    gates: always open (strict priority only)\n");
+			printf("    gates: always open\n");
 			continue;
 		}
 		printf("    base_time=%lld cycle_time=%llu ns\n",
@@ -399,4 +596,6 @@ void config_dump(const struct switch_cfg *c)
 			       (unsigned long long)p->gcl.e[j].start, p->gcl.e[j].gates,
 			       (unsigned long long)p->gcl.e[j].interval);
 	}
+	for (int i = 0; i < c->cls.n; i++)
+		printf("rule %d: %s\n", i, c->cls.rule[i].text);
 }

@@ -3,11 +3,14 @@
 """
 Traffic generator / sink for testing the TSN switch (no dependencies).
 
-  send     emit 802.1Q-tagged test frames with the given PCPs, round robin
+  send     emit test streams round robin (802.1Q-tagged or untagged,
+           raw EtherType 0x88B5 or IPv4/UDP)
   recv     capture test frames with kernel RX timestamps into a JSON file
-  analyze  check captured arrival times against a gate schedule
+  analyze  check captured arrival times / counts / rates
 
-Test frame: [dst][src][0x8100][PCP|VID][0x88B5]["TSNT"][pcp:u8][seq:u32][pad]
+Every stream has a label (default: its PCP) carried in the payload together
+with a sequence number: ... "TSNT" [label:u8] [seq:u32] [padding]. The
+analyzer options that take a PCP refer to this label.
 """
 import argparse
 import json
@@ -36,23 +39,55 @@ def parse_duration(s):
     return int(s)
 
 
-def build_frame(dst, src, pcp, vid, seq, size):
-    tci = (pcp << 13) | (vid & 0xFFF)
-    hdr = dst + src + struct.pack("!HHH", 0x8100, tci, ETH_P_TEST)
-    body = MAGIC + struct.pack("!BI", pcp, seq)
-    frame = hdr + body
-    if len(frame) < size:
-        frame += bytes(size - len(frame))
-    return frame
+def ip_checksum(hdr):
+    total = sum(struct.unpack("!%dH" % (len(hdr) // 2), hdr))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return ~total & 0xFFFF
+
+
+def build_frame(a, dst, src, pcp, vid, label, dport, dscp):
+    """Returns (frame, offset of the sequence number)."""
+    eth = dst + src
+    if not a.untagged:
+        eth += struct.pack("!HH", 0x8100, (pcp << 13) | (vid & 0xFFF))
+    body = MAGIC + struct.pack("!BI", label, 0)
+    if dport is None:
+        frame = eth + struct.pack("!H", ETH_P_TEST) + body
+        seq_off = len(eth) + 2 + 5
+    else:
+        pad = max(0, a.size - (len(eth) + 2 + 20 + 8 + len(body)))
+        payload = body + bytes(pad)
+        udp = struct.pack("!HHHH", a.sport, dport, 8 + len(payload), 0)
+        ip = struct.pack("!BBHHHBBH4s4s", 0x45, dscp << 2, 20 + len(udp) + len(payload), 0, 0,
+                         64, 17, 0, socket.inet_aton(a.sip), socket.inet_aton(a.dip))
+        ip = ip[:10] + struct.pack("!H", ip_checksum(ip)) + ip[12:]
+        frame = eth + struct.pack("!H", 0x0800) + ip + udp + payload
+        seq_off = len(eth) + 2 + 20 + 8 + 5
+    if len(frame) < a.size:
+        frame += bytes(a.size - len(frame))
+    return frame, seq_off
+
+
+def ints(v):
+    return [int(x) for x in v.split(",")] if v else None
 
 
 def cmd_send(a):
     s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
     s.bind((a.iface, 0))
     dst, src = mac_bytes(a.dst), mac_bytes(a.src)
-    pcps = [int(x) for x in a.pcp.split(",")]
-    frames = [build_frame(dst, src, p, a.vid, 0, a.size) for p in pcps]
-    seq = [0] * len(pcps)
+    lists = {"pcp": ints(a.pcp), "vid": ints(a.vid), "label": ints(a.label),
+             "udp": ints(a.udp), "dscp": ints(a.dscp)}
+    n = max(len(v) for v in lists.values() if v)
+    pick = lambda name, k, dflt: lists[name][k % len(lists[name])] if lists[name] else dflt
+    streams = []
+    for k in range(n):
+        pcp = pick("pcp", k, 0)
+        f, off = build_frame(a, dst, src, pcp, pick("vid", k, 100), pick("label", k, pcp),
+                             pick("udp", k, None), pick("dscp", k, 0))
+        streams.append((pick("label", k, pcp), bytearray(f), off))
+    seq = [0] * n
     interval = 1e9 / a.rate
     t_end = time.monotonic_ns() + int(a.duration * 1e9)
     nxt = time.monotonic_ns()
@@ -64,9 +99,9 @@ def cmd_send(a):
             break
         if now < nxt:
             continue
-        k = i % len(pcps)
-        f = bytearray(frames[k])
-        struct.pack_into("!I", f, 23, seq[k])
+        k = i % n
+        _, f, off = streams[k]
+        struct.pack_into("!I", f, off, seq[k])
         try:
             s.send(f)
             seq[k] += 1
@@ -75,7 +110,25 @@ def cmd_send(a):
             pass
         i += 1
         nxt += interval
-    print(json.dumps({"sent": sent, "per_pcp": dict(zip(map(str, pcps), seq))}))
+    per = Counter()
+    for (label, _, _), c in zip(streams, seq):
+        per[str(label)] += c
+    print(json.dumps({"sent": sent, "per_label": dict(per)}))
+
+
+def find_payload(data):
+    """Offset of the TSNT magic in a test frame, or None."""
+    off = 12
+    et = struct.unpack_from("!H", data, off)[0]
+    if et in (0x8100, 0x88A8):
+        off += 4
+        et = struct.unpack_from("!H", data, off)[0]
+    off += 2
+    if et == 0x0800 and len(data) >= off + 28 and data[off + 9] == 17:
+        off += (data[off] & 0x0F) * 4 + 8
+    elif et != ETH_P_TEST:
+        return None
+    return off if data[off: off + 4] == MAGIC else None
 
 
 def cmd_recv(a):
@@ -91,27 +144,22 @@ def cmd_recv(a):
             data, anc, _flags, addr = s.recvmsg(4096, socket.CMSG_SPACE(16))
         except socket.timeout:
             continue
-        if addr[2] == socket.PACKET_OUTGOING:
+        if addr[2] == socket.PACKET_OUTGOING or len(data) < 18:
             continue
-        off = 12
-        et = struct.unpack_from("!H", data, off)[0]
-        pcp_tag = None
-        if et in (0x8100, 0x88A8):
-            pcp_tag = data[14] >> 5
-            off = 16
-            et = struct.unpack_from("!H", data, off)[0]
-        if et != ETH_P_TEST or data[off + 2: off + 6] != MAGIC:
+        off = find_payload(data)
+        if off is None:
             continue
-        pcp, seq = struct.unpack_from("!BI", data, off + 6)
+        label, seq = struct.unpack_from("!BI", data, off + 4)
+        pcp_tag = data[14] >> 5 if struct.unpack_from("!H", data, 12)[0] in (0x8100, 0x88A8) else None
         ts = None
         for lvl, typ, val in anc:
             if lvl == socket.SOL_SOCKET and typ == SCM_TIMESTAMPNS:
                 sec, nsec = struct.unpack("qq", val[:16])
                 ts = sec * 1_000_000_000 + nsec
-        out.append([pcp, seq, ts, len(data), pcp_tag])
+        out.append([label, seq, ts, len(data), pcp_tag])
     with open(a.out, "w") as f:
         json.dump(out, f)
-    print(json.dumps({"received": len(out), "per_pcp": dict(Counter(str(r[0]) for r in out))}))
+    print(json.dumps({"received": len(out), "per_label": dict(Counter(str(r[0]) for r in out))}))
 
 
 def cmd_analyze(a):
@@ -188,6 +236,16 @@ def cmd_analyze(a):
             report.setdefault(str(pcp), {})["frames"] = 0
             ok = False
 
+    for spec in a.rate or []:
+        pcp, lo, hi = spec.split(":")
+        items = sorted((ts, ln) for (p, _, ts, ln, _) in rows if p == int(pcp))
+        mbps = 0.0
+        if len(items) > 1:
+            mbps = sum(ln for _, ln in items[1:]) * 8 / (items[-1][0] - items[0][0]) * 1e3
+        report.setdefault(pcp, {})["rate_mbps"] = round(mbps, 3)
+        if not float(lo) <= mbps <= float(hi):
+            ok = False
+
     for spec in a.count or []:
         pcp, lo, hi = (int(x) for x in spec.split(":"))
         n = len(by_pcp.get(pcp, []))
@@ -208,8 +266,15 @@ def main():
     p.add_argument("--iface", required=True)
     p.add_argument("--dst", required=True)
     p.add_argument("--src", required=True)
-    p.add_argument("--pcp", default="0", help="comma separated list, sent round robin")
-    p.add_argument("--vid", type=int, default=100)
+    p.add_argument("--pcp", default="0", help="comma separated list; one stream per entry, round robin")
+    p.add_argument("--vid", default="100", help="VLAN ID per stream (list, cycled)")
+    p.add_argument("--label", help="payload label per stream (default: its PCP)")
+    p.add_argument("--untagged", action="store_true", help="no 802.1Q tag")
+    p.add_argument("--udp", help="send IPv4/UDP to these destination ports (one per stream)")
+    p.add_argument("--dscp", help="IPv4 DSCP per stream")
+    p.add_argument("--sip", default="10.10.0.1")
+    p.add_argument("--dip", default="10.10.0.2")
+    p.add_argument("--sport", type=int, default=4000)
     p.add_argument("--size", type=int, default=128)
     p.add_argument("--rate", type=float, default=1000, help="frames per second (total)")
     p.add_argument("--duration", type=float, default=2)
@@ -229,6 +294,7 @@ def main():
     p.add_argument("--never", type=int, action="append")
     p.add_argument("--expect", type=int, action="append")
     p.add_argument("--count", action="append", help="PCP:MIN:MAX frames")
+    p.add_argument("--rate", action="append", help="PCP:MIN:MAX Mbit/s (frame bytes, first to last)")
 
     a = ap.parse_args()
     {"send": cmd_send, "recv": cmd_recv, "analyze": cmd_analyze}[a.cmd](a)
