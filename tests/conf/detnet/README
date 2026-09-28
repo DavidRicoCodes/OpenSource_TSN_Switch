@@ -1,0 +1,15 @@
+Three DetNet routers on veth, used by the detnet_* tests:
+
+  h0 --[tsn-sw0] R1 [dn-r1b]==path A==[dn-r2a] R2 [dn-r2b]==[dn-r3a] R3 [tsn-sw1]-- h1
+                   [dn-r1c]=========== path B ==============[dn-r3b]
+
+R1  ingress PE: encapsulates VLAN 10 traffic from h0 (S-label 1000) and
+    replicates it on both paths (PRF)
+R2  relay: rewrites the outer header of path A
+R3  egress PE: eliminates duplicates (PEF), restores the order (POF) and
+    decapsulates towards h1
+
+r2-delay.conf and r1-lossy.conf impair the paths (path A waits for a gate
+that is open 1 ms every 20 ms, path B is shaped with a 2-frame queue and
+drops about half) so that packets
+arrive at R3 out of order.

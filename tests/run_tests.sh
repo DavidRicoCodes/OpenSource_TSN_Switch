@@ -25,6 +25,8 @@ FAILED_NAMES=()
 
 cleanup() {
 	[ -n "$SW_PID" ] && kill -INT $SW_PID 2>/dev/null && wait $SW_PID 2>/dev/null
+	[ ${#DN_PIDS[@]} -gt 0 ] && kill -INT "${DN_PIDS[@]}" 2>/dev/null && wait
+	tests/detnet_topology.sh down
 	tests/veth_topology.sh down 3
 	rm -rf "$WORK"
 }
@@ -261,7 +263,140 @@ t_reload() {
 	return $rc
 }
 
-ALL="connectivity learning link_local tcp qbv_windows guard_band strict_priority classify_l3 vlan_port_map ats reload"
+# ------------------------------------------------------------- DetNet --
+
+# Starts the DetNet routers named in $@ (tests/conf/detnet/<name>.conf).
+DN_PIDS=()
+start_routers() {
+	tests/detnet_topology.sh up
+	for r in "$@"; do
+		$SW -c tests/conf/detnet/$r.conf >"$WORK/$r.log" 2>&1 &
+		DN_PIDS+=($!)
+	done
+	for r in "$@"; do
+		for _ in $(seq 50); do grep -q running "$WORK/$r.log" && continue 2; sleep 0.1; done
+		echo "  router $r failed to start:"; cat "$WORK/$r.log"; return 1
+	done
+}
+
+stop_routers() {
+	local rc=0
+	kill -INT "${DN_PIDS[@]}" 2>/dev/null
+	for pid in "${DN_PIDS[@]}"; do wait $pid || rc=1; done
+	DN_PIDS=()
+	for f in "$WORK"/r*.log "$WORK"/onearm.log "$WORK"/mixed.log; do
+		[ -f "$f" ] || continue
+		grep -q "no leaks" "$f" || { echo "  $(basename $f): frame leak or bad exit"; tail -5 "$f"; rc=1; }
+	done
+	tests/detnet_topology.sh down
+	return $rc
+}
+
+# Counter value from a router log: stat LOG NAME
+stat() { grep -o "$2=[0-9]*" "$WORK/$1.log" | tail -1 | cut -d= -f2; }
+
+dn_send() {
+	h 0 $TT send --iface eth0 --src $MAC0 --dst $MAC1 --pcp 5 --vid 10 --label 1 --udp 7000 \
+		--size 200 --rate 2000 --duration 2 >/dev/null
+}
+
+t_detnet_preof() {
+	# Encap + replication on R1, relay on R2, elimination + decap on R3.
+	start_routers r1 r2 r3-order || return 1
+	capture 1 4 "$WORK/h1.json"
+	sleep 0.5
+	dn_send
+	wait_captures
+	local rc=0
+	$TT analyze "$WORK/h1.json" --count 1:4000:4000 --no-dups >"$WORK/report" || { cat "$WORK/report"; rc=1; }
+	stop_routers || rc=1
+	echo "  R1 encap tx=$(stat r1 tx) (2 replicas), R2 forward rx=$(stat r2 rx), R3 eliminated=$(stat r3-order eliminated)"
+	[ "$(stat r1 tx)" = 8000 ] && [ "$(stat r2 rx)" = 4000 ] && [ "$(stat r3-order eliminated)" = 4000 ] || rc=1
+	return $rc
+}
+
+t_detnet_order() {
+	# Path A complete but delayed up to 19 ms, path B fast but lossy.
+	local rc=0
+	start_routers r1-lossy r2-delay r3-noorder || return 1
+	capture 1 4 "$WORK/noorder.json"
+	sleep 0.5
+	dn_send
+	wait_captures
+	stop_routers || rc=1
+	local reord=$(python3 -c "import json;print(json.load(open('/dev/stdin'))['1']['reordered'])" \
+		< <($TT analyze "$WORK/noorder.json" --allow-reorder | head -n -1))
+	echo "  without POF: $reord out-of-order arrivals at h1"
+	[ "$reord" -gt 0 ] || { echo "  the impairment did not reorder anything"; rc=1; }
+
+	start_routers r1-lossy r2-delay r3-order || return 1
+	capture 1 4 "$WORK/order.json"
+	sleep 0.5
+	dn_send
+	wait_captures
+	$TT analyze "$WORK/order.json" --count 1:4000:4000 --no-dups >"$WORK/report" || { cat "$WORK/report"; rc=1; }
+	stop_routers || rc=1
+	echo "  with POF: 0 out of order, R3 held back $(stat r3-order reordered) packets, lost=$(stat r3-order lost)"
+	return $rc
+}
+
+t_detnet_pof_timeout() {
+	# Path A is down (no R2) and path B loses packets: the gaps never fill,
+	# POF must give up after order_max_delay and keep the rest in order.
+	start_routers r1-lossy r3-order || return 1
+	capture 1 5 "$WORK/h1.json"
+	sleep 0.5
+	dn_send
+	wait_captures
+	local rc=0
+	$TT analyze "$WORK/h1.json" --no-dups --expect 1 >"$WORK/report" || { cat "$WORK/report"; rc=1; }
+	stop_routers || rc=1
+	local got=$(python3 -c "import json;print(len(json.load(open('$WORK/h1.json'))))")
+	local lost=$(stat r3-order lost) to=$(stat r3-order timeouts)
+	echo "  delivered=$got lost=$lost timeouts=$to"
+	# A loss before the first or after the last delivered packet is not a
+	# visible gap, so up to 2 losses may be missing from the counter.
+	[ "$to" -gt 0 ] && [ $((got + lost)) -le 4000 ] && [ $((got + lost)) -ge 3998 ] || rc=1
+	return $rc
+}
+
+t_detnet_onearm() {
+	# Single-port router: VLAN 10 from h0 comes back to h0 inside the tunnel.
+	start_routers onearm || return 1
+	capture 0 4 "$WORK/h0.json"
+	sleep 0.5
+	dn_send
+	wait_captures
+	local rc=0
+	$TT analyze "$WORK/h0.json" --count 1:4000:4000 --no-dups >"$WORK/report" || { cat "$WORK/report"; rc=1; }
+	stop_routers || rc=1
+	return $rc
+}
+
+t_detnet_mixed() {
+	# Encap rule on VLAN 10 with bridging on: IP is tunnelled, non-IP is bridged.
+	start_routers mixed || return 1
+	capture 1 4 "$WORK/h1.json"
+	sleep 0.5
+	h 0 $TT send --iface eth0 --src $MAC0 --dst $MAC1 --pcp 0 --vid 10 --label 3 --rate 1000 --duration 1 >/dev/null
+	h 0 $TT send --iface eth0 --src $MAC0 --dst $MAC1 --pcp 0 --vid 10 --label 4 --udp 7000 --rate 1000 --duration 1 >/dev/null
+	wait_captures
+	local rc=0
+	$TT analyze "$WORK/h1.json" --count 3:1000:1000 --count 4:1000:1000 --no-dups >"$WORK/report" ||
+		{ cat "$WORK/report"; rc=1; }
+	stop_routers || rc=1
+	# The IP frames must have arrived inside the tunnel (VLAN 50), the others as sent (VLAN 10).
+	python3 - "$WORK/h1.json" <<'PY' || rc=1
+import json, sys
+rows = json.load(open(sys.argv[1]))
+ok = all((r[0] == 4) == (r[3] > 128) for r in rows)
+print("  non-IP bridged unchanged, IP tunnelled:", "yes" if ok else "NO")
+sys.exit(0 if ok else 1)
+PY
+	return $rc
+}
+
+ALL="connectivity learning link_local tcp qbv_windows guard_band strict_priority classify_l3 vlan_port_map ats reload detnet_preof detnet_order detnet_pof_timeout detnet_onearm detnet_mixed"
 TESTS=${*:-$ALL}
 
 for t in $TESTS; do

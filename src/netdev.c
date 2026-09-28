@@ -119,6 +119,22 @@ int64_t netdev_speed_mbps(const char *ifname)
 	return v;
 }
 
+int netdev_mtu(const char *ifname)
+{
+	char path[128];
+	int v = -1;
+	FILE *f;
+
+	snprintf(path, sizeof(path), "/sys/class/net/%s/mtu", ifname);
+	f = fopen(path, "r");
+	if (!f)
+		return -1;
+	if (fscanf(f, "%d", &v) != 1)
+		v = -1;
+	fclose(f);
+	return v;
+}
+
 int netdev_rx_queues(const char *ifname)
 {
 	char path[128];

@@ -1,13 +1,15 @@
-# tsn-switch — an open source TSN switch (802.1Qbv + ATS) on AF_XDP
+# tsn-switch — an open source TSN switch and DetNet router on AF_XDP
 
 `tsn-switch` turns a Linux box with several NICs into an Ethernet switch
 that implements the IEEE 802.1Qbv **time-aware shaper** (TAS) and
-token-bucket **asynchronous traffic shaping** (ATS). Frames are steered from
+token-bucket **asynchronous traffic shaping** (ATS). It can also act as a
+**DetNet router** (MPLS over UDP/IP with packet replication, elimination and
+ordering). Frames are steered from
 the NIC into user space by a small XDP program and switched by busy-polling
 threads over **AF_XDP** sockets that share one UMEM. That means no kernel
 bridge, no qdisc and no packet copies in user space.
 
-This is the C adaptation of TSN switch from the paper:
+This is the C adaptation of the TSN switch and DetNet router from the paper:
 
 > D. Rico Menendez, A. de la Oliva, C. Barroso-Fernández and F. Luque Schempp,
 > "Bridging the gap between TSN and Open-Source," ICTON 2025, IEEE.
@@ -43,6 +45,13 @@ prototype:
 - **Strict priority** transmission selection among the eligible classes.
 - **Runtime schedule updates**: `SIGHUP` re-reads the GCLs and token buckets
   without stopping the switch.
+- **DetNet router** (RFC 9025 MPLS over UDP/IP, RFC 8964 d-CW): ingress
+  encapsulation, relay forwarding with outer-header rewrite (and optional
+  label swap), egress decapsulation, and the PREOF service functions:
+  replication, elimination (sliding sequence window) and ordering (RFC 9550
+  POF with a maximum delay). DetNet output goes through the TSN egress
+  queues, so DetNet flows get Qbv/ATS scheduling. Single-port ("router on a
+  stick") nodes are supported.
 - **Guard band / link-rate model**: a frame is only started if it finishes
   on the wire before its gate closes, and only `tx_lookahead` of traffic is
   queued ahead of the wire, so a gate closing really stops the class.
@@ -69,8 +78,10 @@ prototype:
 Every port thread busy-polls its own AF_XDP socket and does, in a loop:
 
 1. reap TX completions (return frames to the pool),
-2. receive, classify, learn, and enqueue each frame descriptor on the egress
-   port's traffic-class queue (for a flood, on several queues with a refcount),
+2. receive and learn; hand DetNet frames to the DetNet layer (which
+   rewrites, replicates, eliminates or holds them for ordering); classify and
+   enqueue each frame descriptor on the egress port's traffic-class queue
+   (for a flood, on several queues with a refcount),
 3. refill the fill ring,
 4. evaluate its gate control list at "now" and transmit from the classes
    whose gate is open and whose token bucket (if any) has credit, highest
@@ -83,6 +94,7 @@ Sources:
 | `bpf/tsn_xdp.bpf.c` | XDP program: control frames to the kernel, everything else to the port's AF_XDP socket |
 | `src/tsn_switch.c` | port threads, forwarding, Qbv/ATS transmission selection, SIGHUP reload, setup, stats |
 | `src/classify.c` | classification rules (L2/L3/L4 match → traffic class / egress port) |
+| `src/detnet.c` | DetNet router: encap / forward / decap, PRF, PEF, POF |
 | `src/gcl.c` | gate control list evaluation (when does each gate close?) |
 | `src/fdb.c` | lock-free learning MAC table |
 | `src/mpsc.h` | bounded lock-free MPSC queue (one per egress port and TC) |
@@ -174,10 +186,60 @@ send `kill -HUP <pid>`. Ports, rules and the PCP map need a restart. The
 switch refuses a reload that changes the ports and warns about keys it
 cannot apply live.
 
+## DetNet router
+
+The DetNet flow table is a separate file named in the main configuration:
+
+```ini
+[global]
+bridging = no                    ; pure router: no L2 flooding between routers
+detnet_config = detnet.conf
+```
+
+```ini
+# ingress PE: VLAN 10 becomes DetNet flow 1000, replicated on two paths
+[flow app]
+action = encap
+label = 1000
+match = in_port=p0 vid=10
+output = port=p1 dst_mac=0a:00:00:00:02:01 src_mac=0a:00:00:00:01:02 vid=20 pcp=7 src_ip=192.168.12.1 dst_ip=192.168.12.2
+output = port=p2 dst_mac=0a:00:00:00:03:02 src_mac=0a:00:00:00:01:03 vid=30 pcp=7 src_ip=192.168.13.1 dst_ip=192.168.13.3
+
+# egress PE: remove duplicates, restore the order, decapsulate
+[flow app-out]
+action = decap
+label = 1000
+eliminate = yes
+order = yes
+order_max_delay = 5ms
+output = port=p0 dst_mac=02:00:00:00:00:01 src_mac=0a:00:00:00:03:03
+```
+
+Relays use `action = forward` with a new outer header per output. Every key,
+and how the Go prototype's `detnetData.json` / `newFlows.json` actions map
+onto these flows, is documented in
+[`config/detnet-example.conf`](config/detnet-example.conf).
+
+Compared with the Go prototype:
+- The S-label is a real MPLS label stack entry (20-bit label, bottom of
+  stack, TTL 255), and the d-CW carries a 28-bit sequence number.
+- Replication emits every replica; the Go version returned only the first.
+- Elimination uses a sliding history window, so a lost replica can't leak
+  state.
+- Ordering (POF) is new.
+- Forward/decap flows only take packets on their UDP port (`udp_port`,
+  default 6635).
+- The HTTP reconfiguration endpoint of the Go router is not ported. Flows
+  are loaded at startup.
+
+The tunnel adds 36 bytes at the IP layer, so give DetNet links an MTU of at
+least the inner packet size + 36. Longer frames are dropped and counted.
+
 ## Tests
 
 `make test` (or `sudo tests/run_tests.sh [name...]`) builds a 3-host veth
-topology and runs:
+topology (plus the links between three DetNet routers for the `detnet_*`
+tests) and runs:
 
 | test | checks |
 |---|---|
@@ -192,6 +254,17 @@ topology and runs:
 | `vlan_port_map` | a rule sends VID 200 to h2 although the destination MAC is h1's; VID 100 still follows learning |
 | `ats` | TC7 shaped to 2 Mbit/s (measured 1.996 Mbit/s) while unshaped TC0 is delivered in full |
 | `reload` | the two GCL windows are swapped with SIGHUP while running; arrivals follow the new schedule |
+| `detnet_preof` | 3 routers: R1 encapsulates and replicates on two paths, R2 relays, R3 eliminates and decapsulates. h1 gets every packet exactly once (R3 eliminated 4000 of 8000) |
+| `detnet_order` | path A complete but delayed by a gate, path B fast and lossy: without POF h1 sees ~100 out-of-order packets, with POF none, none lost, no duplicates |
+| `detnet_pof_timeout` | path A down, path B lossy: POF gives up on the gaps after `order_max_delay`; everything that arrives is delivered in order |
+| `detnet_onearm` | a single-port router encapsulates and sends traffic back on the port it came from |
+| `detnet_mixed` | a switch with an encap rule on VLAN 10 still bridges non-IP frames (ARP…) on that VLAN |
+
+`make unit` runs deterministic tests of elimination and ordering with a
+simulated clock (no root): the next packet is delivered when the ordering
+buffer is full, elimination recovers from a sequence-number restart,
+PEF+POF work across the 2^28 wrap, and every held packet is released after
+`order_max_delay`. `make test` runs both suites.
 
 Every test also checks that the switch exits cleanly with all UMEM frames
 accounted for. The timing tests use kernel RX timestamps on the receiving
@@ -217,7 +290,9 @@ PCP 3: 0 frames                                 (gate never open)
 - ATS is a token bucket per traffic class, as described in the paper, not
   the full 802.1Qcr per-stream eligibility-time algorithm with scheduler
   groups.
-- Not implemented: the DetNet router (see below), frame preemption
+- DetNet: IPv4 tunnels only (the inner packet may be IPv4 or IPv6); no
+  MPLS label stacks deeper than the S-label; no HTTP reconfiguration.
+- Not implemented: frame preemption
   (802.1Qbu/802.3br), per-stream filtering and policing (802.1Qci),
   credit-based shaper (802.1Qav), FRER (802.1CB), VLAN membership / tag
   rewriting.
@@ -237,7 +312,9 @@ PCP 3: 0 frames                                 (gate never open)
 | offloads disabled, promiscuous mode, XDP attached per interface | ✅ |
 | ptp4l / phc2sys started automatically as master or client | ➖ run them yourself (see above) |
 | JSON configuration files, one mode per file | ➖ one INI file; TAS and ATS can be combined per port |
-| DetNet router: MPLS over UDP/IP, encapsulation / decapsulation / forwarding, PREOF | ❌ not yet ported from the Go prototype |
+| DetNet router: MPLS over UDP/IP, encapsulation / decapsulation / forwarding | ✅ (`detnet_config`) |
+| PREOF: replication, elimination, ordering | ✅ (ordering is new; it wasn't in the Go prototype) |
+| DetNet flows reconfigured at runtime (HTTP API in the Go prototype) | ➖ restart to change the flows |
 
 ## Citation
 

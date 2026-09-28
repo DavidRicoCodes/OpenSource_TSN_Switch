@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: GPL-2.0
 #
 #   make            build build/tsn-switch and build/tsn_xdp.bpf.o
-#   make test       run the veth integration tests (needs root)
+#   make unit       run the DetNet PEF/POF unit tests (no root needed)
+#   make test       run the unit tests and the veth integration tests (needs root)
 #   make clean
 
 CC      ?= gcc
@@ -38,10 +39,16 @@ $(BUILD)/tsn-switch: $(OBJS)
 $(BUILD)/tsn_xdp.bpf.o: bpf/tsn_xdp.bpf.c src/common.h | $(BUILD)
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
-test: all
+$(BUILD)/detnet_unit: tests/unit/detnet_unit.c $(filter-out $(BUILD)/tsn_switch.o $(BUILD)/netdev.o $(BUILD)/xsk.o,$(OBJS))
+	$(CC) $(CFLAGS) -Isrc $^ -o $@ -pthread
+
+unit: $(BUILD)/detnet_unit
+	./$(BUILD)/detnet_unit
+
+test: all unit
 	sudo ./tests/run_tests.sh
 
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test clean
+.PHONY: all unit test clean
