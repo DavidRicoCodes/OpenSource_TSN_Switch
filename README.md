@@ -7,7 +7,7 @@ the NIC into user space by a small XDP program and switched by busy-polling
 threads over **AF_XDP** sockets that share one UMEM. That means no kernel
 bridge, no qdisc and no packet copies in user space.
 
-This is the TSN switch of the paper:
+This is the C adaptation of TSN switch from the paper:
 
 > D. Rico Menendez, A. de la Oliva, C. Barroso-Fernández and F. Luque Schempp,
 > "Bridging the gap between TSN and Open-Source," ICTON 2025, IEEE.
