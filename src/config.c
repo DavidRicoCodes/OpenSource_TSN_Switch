@@ -131,6 +131,7 @@ static void set_defaults(struct switch_cfg *c)
 	c->disable_vlan_offload = 1;
 	c->fdb_aging = 300;
 	c->stats_interval = 1;
+	c->bridging = 1;
 	for (int i = 0; i < 8; i++)
 		c->pcp_to_tc[i] = i;
 }
@@ -320,6 +321,8 @@ int config_load(struct switch_cfg *c, const char *path)
 
 	while (fgets(line, sizeof(line), f)) {
 		lineno++;
+		if (!strchr(line, '\n') && !feof(f))
+			ERR("line too long (max %zu characters)", sizeof(line) - 2);
 		char *s = line;
 		char *hash = strpbrk(s, "#;");
 		if (hash)
@@ -416,6 +419,15 @@ int config_load(struct switch_cfg *c, const char *path)
 			} else if (!strcmp(k, "stats_interval")) {
 				if (parse_u64(v, &u) || u > 3600) ERR("bad stats_interval");
 				c->stats_interval = u;
+			} else if (!strcmp(k, "bridging")) {
+				if (parse_bool(v, &c->bridging)) ERR("bad boolean");
+			} else if (!strcmp(k, "detnet_config")) {
+				const char *slash = strrchr(path, '/');
+				if (v[0] == '/' || !slash)
+					snprintf(c->detnet_path, sizeof(c->detnet_path), "%s", v);
+				else
+					snprintf(c->detnet_path, sizeof(c->detnet_path), "%.*s/%s",
+						 (int)(slash - path), path, v);
 			} else if (!strcmp(k, "bpf_object")) {
 				snprintf(c->bpf_obj, sizeof(c->bpf_obj), "%s", v);
 			} else {
@@ -529,8 +541,10 @@ int config_load(struct switch_cfg *c, const char *path)
 	fclose(f);
 
 	lineno = 0;
-	if (c->nports < 2)
-		ERR("at least two [port] sections are required");
+	/* A DetNet router may be a single-armed ("router on a stick") node. */
+	if (c->nports < (c->detnet_path[0] ? 1 : 2))
+		ERR("at least %s [port] section%s required", c->detnet_path[0] ? "one" : "two",
+		    c->detnet_path[0] ? " is" : "s are");
 	for (int i = 0; i < c->nports; i++) {
 		struct port_cfg *pp = &c->port[i];
 		char err[128];
@@ -570,8 +584,9 @@ int config_load(struct switch_cfg *c, const char *path)
 
 void config_dump(const struct switch_cfg *c)
 {
-	printf("clock=%s frames=%u frame_size=%u queue_depth=%u ring=%u\n",
-	       clock_name(c->clock_id), c->frames, c->frame_size, c->queue_depth, c->ring_size);
+	printf("clock=%s frames=%u frame_size=%u queue_depth=%u ring=%u%s\n",
+	       clock_name(c->clock_id), c->frames, c->frame_size, c->queue_depth, c->ring_size,
+	       c->bridging ? "" : " bridging=off");
 	printf("pcp->tc:");
 	for (int i = 0; i < 8; i++)
 		printf(" %d->%d", i, c->pcp_to_tc[i]);
@@ -598,4 +613,41 @@ void config_dump(const struct switch_cfg *c)
 	}
 	for (int i = 0; i < c->cls.n; i++)
 		printf("rule %d: %s\n", i, c->cls.rule[i].text);
+}
+
+/* Parsing helpers shared with the DetNet configuration (detnet.c). */
+char *cfg_trim(char *s) { return trim(s); }
+int cfg_parse_bool(const char *v, int *out) { return parse_bool(v, out); }
+int cfg_parse_u64(const char *v, uint64_t *out) { return parse_u64(v, out); }
+int cfg_parse_duration(const char *v, uint64_t *out) { return parse_duration(v, out); }
+int cfg_parse_mac(const char *v, uint8_t *mac) { return parse_mac(v, mac); }
+int cfg_parse_prefix(const char *v, uint32_t *addr, uint32_t *mask) { return parse_prefix(v, addr, mask); }
+
+int cfg_port_by_name(const struct switch_cfg *c, const char *name)
+{
+	return find_port(c, name);
+}
+
+/* A classification rule used only as a match (no tc/port action). */
+int cfg_parse_match(const struct switch_cfg *c, const char *text, struct cls_rule *r,
+		    char *err, size_t errlen)
+{
+	char in_name[32], out_name[32];
+	char buf[600];
+
+	/* parse_rule() insists on an action: supply a dummy one. */
+	snprintf(buf, sizeof(buf), "%s tc=0", text);
+	if (parse_rule(buf, r, in_name, out_name, err, errlen))
+		return -1;
+	if (out_name[0]) {
+		snprintf(err, errlen, "'port=' is not allowed in a match");
+		return -1;
+	}
+	r->tc = -1;
+	snprintf(r->text, sizeof(r->text), "%s", text);
+	if (in_name[0] && (r->in_port = find_port(c, in_name)) < 0) {
+		snprintf(err, errlen, "unknown port '%s'", in_name);
+		return -1;
+	}
+	return 0;
 }

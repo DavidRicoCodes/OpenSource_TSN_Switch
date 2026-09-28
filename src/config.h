@@ -52,6 +52,8 @@ struct switch_cfg {
 	uint32_t fdb_aging;
 	uint32_t stats_interval;  /* seconds, 0 = off */
 	char bpf_obj[256];
+	char detnet_path[512];    /* DetNet flow table, "" = no DetNet */
+	int bridging;             /* 0: only DetNet flows and port= rules are forwarded */
 
 	/* [pcp-map] */
 	uint8_t pcp_to_tc[8];
@@ -69,5 +71,15 @@ struct switch_cfg {
 int config_load(struct switch_cfg *c, const char *path);
 void config_dump(const struct switch_cfg *c);
 const char *clock_name(int clock_id);
+
+char *cfg_trim(char *s);
+int cfg_parse_bool(const char *v, int *out);
+int cfg_parse_u64(const char *v, uint64_t *out);
+int cfg_parse_duration(const char *v, uint64_t *out);
+int cfg_parse_mac(const char *v, uint8_t *mac);
+int cfg_parse_prefix(const char *v, uint32_t *addr, uint32_t *mask);
+int cfg_port_by_name(const struct switch_cfg *c, const char *name);
+int cfg_parse_match(const struct switch_cfg *c, const char *text, struct cls_rule *r,
+		    char *err, size_t errlen);
 
 #endif

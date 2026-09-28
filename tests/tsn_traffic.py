@@ -125,7 +125,13 @@ def find_payload(data):
         et = struct.unpack_from("!H", data, off)[0]
     off += 2
     if et == 0x0800 and len(data) >= off + 28 and data[off + 9] == 17:
-        off += (data[off] & 0x0F) * 4 + 8
+        udp = off + (data[off] & 0x0F) * 4
+        off = udp + 8
+        # DetNet MPLS-in-UDP: skip S-label + d-CW and look inside the tunnel.
+        if struct.unpack_from("!H", data, udp + 2)[0] == 6635 and len(data) >= off + 36:
+            off += 8
+            if data[off] >> 4 == 4 and data[off + 9] == 17:
+                off += (data[off] & 0x0F) * 4 + 8
     elif et != ETH_P_TEST:
         return None
     return off if data[off: off + 4] == MAGIC else None
@@ -191,6 +197,9 @@ def cmd_analyze(a):
         r = {"frames": len(items)}
         seqs = [s for s, _ in items]
         r["reordered"] = sum(1 for x, y in zip(seqs, seqs[1:]) if y < x)
+        r["duplicates"] = len(seqs) - len(set(seqs))
+        if a.no_dups and r["duplicates"]:
+            ok = False
         if pcp in windows:
             bad = 0
             worst = 0
@@ -213,7 +222,7 @@ def cmd_analyze(a):
             r["phase_max_us"] = round(max(phases) / 1e3, 1) if phases else None
             if bad:
                 ok = False
-        if r["reordered"]:
+        if r["reordered"] and not a.allow_reorder:
             ok = False
         report[str(pcp)] = r
 
@@ -294,6 +303,8 @@ def main():
     p.add_argument("--never", type=int, action="append")
     p.add_argument("--expect", type=int, action="append")
     p.add_argument("--count", action="append", help="PCP:MIN:MAX frames")
+    p.add_argument("--no-dups", action="store_true", help="fail on repeated sequence numbers")
+    p.add_argument("--allow-reorder", action="store_true", help="do not fail on out-of-order arrivals")
     p.add_argument("--rate", action="append", help="PCP:MIN:MAX Mbit/s (frame bytes, first to last)")
 
     a = ap.parse_args()

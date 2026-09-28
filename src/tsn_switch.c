@@ -34,6 +34,7 @@
 
 #include "common.h"
 #include "config.h"
+#include "detnet.h"
 #include "fdb.h"
 #include "frame_pool.h"
 #include "gcl.h"
@@ -82,12 +83,15 @@ struct port {
 	int64_t wire_free_at;
 
 	struct frame_cache cache;
+	struct dn_ctx dn;
+	uint32_t max_frame;     /* MTU + L2 header: longer DetNet frames are dropped */
 	pthread_t thread;
 
 	_Alignas(CACHELINE) struct mpsc_queue txq[TSN_NUM_TC];
 
-	_Alignas(CACHELINE) stat_t rx, rx_bytes, rx_filtered, rx_runt, flooded;
+	_Alignas(CACHELINE) stat_t rx, rx_bytes, rx_filtered, rx_runt, flooded, not_forwarded;
 	stat_t tx, completed, pool_empty; /* pool_empty: refills that found no frame */
+	_Atomic uint64_t too_big;         /* DetNet output larger than the port MTU */
 	struct tc_stats tc[TSN_NUM_TC];
 };
 
@@ -97,6 +101,8 @@ static struct fdb fdb;
 static struct port ports[TSN_MAX_PORTS];
 static int nports;
 static struct xdp_prog xprog;
+static struct detnet detnet;
+static int have_detnet;
 static volatile sig_atomic_t stop, reload_req;
 
 static void on_signal(int sig)
@@ -131,6 +137,35 @@ static inline void enqueue(struct port *in, struct port *out, int tc, uint64_t a
 	frame_put(&pool, &in->cache, addr);
 }
 
+/* Frames produced by the DetNet layer (arg = the calling thread's port). */
+static void dn_emit(void *arg, int in_port, int out, int tc, uint64_t addr, uint32_t len)
+{
+	struct port *self = arg;
+
+	if (out >= 0) {
+		if (unlikely(len > ports[out].max_frame)) {
+			atomic_fetch_add_explicit(&ports[out].too_big, 1, memory_order_relaxed);
+			frame_put(&pool, &self->cache, addr);
+			return;
+		}
+		enqueue(self, &ports[out], tc, addr, len);
+		return;
+	}
+	/* Unknown next-hop MAC: flood, but never back to where it came from. */
+	int n = 0;
+	for (int i = 0; i < nports; i++)
+		n += i != in_port && len <= ports[i].max_frame;
+	if (!n) {
+		frame_put(&pool, &self->cache, addr);
+		return;
+	}
+	if (n > 1)
+		frame_get(&pool, addr, n - 1);
+	for (int i = 0; i < nports; i++)
+		if (i != in_port && len <= ports[i].max_frame)
+			enqueue(self, &ports[i], tc, addr, len);
+}
+
 static inline void rx_frame(struct port *in, uint64_t addr, uint32_t len, uint32_t now_s)
 {
 	const uint8_t *pkt = frame_data(&pool, addr);
@@ -141,6 +176,14 @@ static inline void rx_frame(struct port *in, uint64_t addr, uint32_t len, uint32
 		frame_put(&pool, &in->cache, addr);
 		return;
 	}
+
+	const uint8_t *dst = pkt, *src = pkt + 6;
+	if (likely(!mac_is_multicast(src)))
+		fdb_learn(&fdb, src, in->idx, now_s);
+
+	/* DetNet flows are routed by the DetNet layer, everything else is bridged. */
+	if (have_detnet && detnet_rx(&detnet, &in->dn, in->idx, addr, len))
+		return;
 
 	uint16_t proto = (uint16_t)(pkt[12] << 8 | pkt[13]);
 	if ((proto == ETH_P_8021Q_ || proto == ETH_P_8021AD_) && len >= ETH_HLEN_ + 4)
@@ -158,9 +201,12 @@ static inline void rx_frame(struct port *in, uint64_t addr, uint32_t len, uint32
 		}
 	}
 
-	const uint8_t *dst = pkt, *src = pkt + 6;
-	if (likely(!mac_is_multicast(src)))
-		fdb_learn(&fdb, src, in->idx, now_s);
+	if (forced < 0 && !cfg.bridging) {
+		/* Pure DetNet router: no L2 forwarding of other traffic. */
+		STAT_INC(in->not_forwarded);
+		frame_put(&pool, &in->cache, addr);
+		return;
+	}
 
 	int out = forced;
 	if (out < 0 && !mac_is_multicast(dst))
@@ -178,6 +224,10 @@ static inline void rx_frame(struct port *in, uint64_t addr, uint32_t len, uint32
 
 	/* Broadcast, multicast or unknown unicast: flood to every other port. */
 	STAT_INC(in->flooded);
+	if (nports == 1) {
+		frame_put(&pool, &in->cache, addr);
+		return;
+	}
 	if (nports > 2)
 		frame_get(&pool, addr, nports - 2);
 	for (int i = 0; i < nports; i++)
@@ -194,6 +244,10 @@ static void rx_poll(struct port *p)
 
 	uint32_t now_s = now_sec_coarse();
 	uint64_t bytes = 0;
+	if (have_detnet) {
+		p->dn.now = now_ns();
+		p->dn.now_s = now_s;
+	}
 	for (uint32_t i = 0; i < n; i++) {
 		const struct xdp_desc *d = xring_rx_desc(&p->xsk.rx, idx + i);
 		if (i + 1 < n)
@@ -373,6 +427,10 @@ static void *port_thread(void *arg)
 	for (int tc = 0; tc < TSN_NUM_TC; tc++)
 		tb_configure(&p->tb[tc], &p->cfg->ats[tc], now_ns());
 
+	p->dn = (struct dn_ctx){ .pool = &pool, .cache = &p->cache, .fdb = &fdb,
+				 .emit = dn_emit, .arg = p };
+	const int dn_poll = have_detnet && detnet.npof;
+
 	while (!stop) {
 		struct port_update *u = atomic_load_explicit(&p->update, memory_order_relaxed);
 		if (unlikely(u) && (u = atomic_exchange(&p->update, NULL))) {
@@ -384,6 +442,11 @@ static void *port_thread(void *arg)
 		}
 		comp_reap(p);
 		rx_poll(p);
+		if (dn_poll) {
+			p->dn.now = now_ns();
+			p->dn.now_s = now_sec_coarse();
+			detnet_poll(&detnet, &p->dn, p->idx);
+		}
 		fill_refill(p);
 		xsk_kick_rx(&p->xsk);
 		tx_schedule(p, now_ns());
@@ -472,6 +535,11 @@ static int setup(void)
 		if (!p->ps_per_byte && p->gcl.n && p->cfg->guard_band)
 			fprintf(stderr, "warning: port %s: link speed unknown, guard band disabled "
 				"(set link_speed)\n", p->cfg->name);
+
+		int mtu = netdev_mtu(p->cfg->ifname);
+		p->max_frame = (mtu > 0 ? mtu : 1500) + 18;
+		if (p->max_frame > cfg.frame_size - 256)
+			p->max_frame = cfg.frame_size - 256;
 
 		int nq = netdev_rx_queues(p->cfg->ifname);
 		if (nq > 1)
@@ -622,6 +690,8 @@ static void print_stats(struct snap *prev, double dt)
 	}
 	printf("fdb entries: %d, free frames: %llu\n", fdb_count(&fdb, now_sec_coarse()),
 	       (unsigned long long)frame_pool_free_count(&pool));
+	if (have_detnet)
+		detnet_print_stats(&detnet);
 	fflush(stdout);
 }
 
@@ -633,6 +703,9 @@ static void print_stats(struct snap *prev, double dt)
 static void account_frames(void)
 {
 	uint64_t n;
+
+	if (have_detnet && nports)
+		detnet_drain(&detnet, &pool, &ports[0].cache);
 
 	/* Return queued and completed frames to the pool first. */
 	for (int i = 0; i < nports; i++) {
@@ -675,6 +748,9 @@ static void print_final(void)
 		       (unsigned long long)STAT_GET(p->completed), (unsigned long long)STAT_GET(p->rx_filtered),
 		       (unsigned long long)STAT_GET(p->rx_runt), (unsigned long long)STAT_GET(p->flooded),
 		       (unsigned long long)STAT_GET(p->pool_empty));
+		if (!cfg.bridging)
+			printf("         not forwarded (bridging off): %llu\n",
+			       (unsigned long long)STAT_GET(p->not_forwarded));
 		printf("         tx per TC:");
 		for (int tc = 0; tc < TSN_NUM_TC; tc++)
 			printf(" %d:%llu", tc, (unsigned long long)STAT_GET(p->tc[tc].tx));
@@ -686,6 +762,12 @@ static void print_final(void)
 	for (int i = 0; i < cfg.cls.n; i++)
 		printf("rule %d hits=%llu: %s\n", i, (unsigned long long)atomic_load(&cfg.cls.hits[i]),
 		       cfg.cls.rule[i].text);
+	for (int i = 0; i < nports; i++)
+		if (atomic_load(&ports[i].too_big))
+			printf("%s: %llu DetNet frames dropped, larger than the MTU\n", ports[i].cfg->name,
+			       (unsigned long long)atomic_load(&ports[i].too_big));
+	if (have_detnet)
+		detnet_print_stats(&detnet);
 }
 
 /* ---------------------------------------------------------------- reload -- */
@@ -735,6 +817,8 @@ static void reload_config(const char *path)
 	}
 	if (!same_rules(&cfg.cls, &n->cls) || memcmp(cfg.pcp_to_tc, n->pcp_to_tc, sizeof(cfg.pcp_to_tc)))
 		fprintf(stderr, "warning: [classify] and [pcp-map] changes need a restart\n");
+	if (have_detnet)
+		printf("note: DetNet flows are not reloaded (restart to change %s)\n", cfg.detnet_path);
 
 	for (int i = 0; i < nports; i++) {
 		struct port_update *u = malloc(sizeof(*u));
@@ -800,6 +884,12 @@ int main(int argc, char **argv)
 		cfg.stats_interval = 0;
 
 	config_dump(&cfg);
+	if (cfg.detnet_path[0]) {
+		if (detnet_load(&detnet, cfg.detnet_path, &cfg))
+			return 1;
+		have_detnet = detnet.n > 0;
+		detnet_dump(&detnet, &cfg);
+	}
 	if (check)
 		return 0;
 
@@ -860,5 +950,6 @@ int main(int argc, char **argv)
 	print_final();
 	account_frames();
 	teardown();
+	detnet_free(&detnet);
 	return rc;
 }

@@ -30,6 +30,7 @@ int64_t netdev_speed_mbps(const char *ifname);
  */
 int  netdev_disable_vlan_offload(const char *ifname);
 int  netdev_rx_queues(const char *ifname);
+int  netdev_mtu(const char *ifname);
 
 /* A switch port must accept frames for every MAC address. */
 int  netdev_set_promisc(const char *ifname, int on, int *was_on);
